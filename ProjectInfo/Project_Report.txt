@@ -1,0 +1,240 @@
+DarkWeb_CTI_Website — Project Report
+=====================================
+
+1. Project Overview
+-------------------
+DarkWeb_CTI_Website is a lightweight threat-intelligence labeling and dashboard project that processes scraped or uploaded textual posts, extracts IOCs and threat indicators, scores each post for threat likelihood, and exposes a Streamlit-based dashboard for exploration and single-item scoring. The repository contains standalone labeling utilities, dataset CSVs, keyword and IOC extraction logic, and database upload utilities.
+
+Key files referenced in this report (source):
+- dashboard_app.py (frontend dashboard)
+- Database.py (Postgres upload / DB utilities)
+- threat_labeler_standalone.py (labeling logic)
+- threat_scoring_formulas.txt (scoring explanation)
+- language_label.py / language_dataset_threat_labeled.csv (language handling and labeled dataset)
+- requirements.txt (runtime dependencies)
+
+Purpose: provide a reproducible, auditable pipeline that assigns a numeric Threat_Confidence (0..1) and a categorical Threat_Level (None/Low/Medium/High/Critical) to each text post.
+
+
+2. Architecture and Data Flows
+------------------------------
+High-level flow:
+- Ingest raw dataset (CSV) with columns including: Author, Texts, Language, and optionally existing Threat_Confidence/Threat_Level.
+- Run `threat_labeler_standalone.py` against the CSV: it performs IOC extraction, token + phrase keyword matching, computes raw scores, converts to a base confidence, applies per-hit multipliers and author-history multipliers, and maps confidence to Threat_Level with a safety cap.
+- Result: a labeled CSV (e.g., `language_dataset_threat_labeled.csv`).
+- (Optional) Upload labeled CSV to Postgres using `Database.py` which uses `psycopg2` and `COPY` for bulk import. Default target table name: `threat_intelligence_data`.
+- Dashboard (`dashboard_app.py`) reads from the Postgres DB and supports single-record scoring by reusing the same labeling logic and blending it with author-history priors.
+
+Data stores:
+- Local CSV files in the repo for development and dataset iteration.
+- External Postgres (Supabase-style) instance used for production/dashboards; connection parameters are read from env or flags in `Database.py`.
+
+Sequence diagram (logical):
+1) Raw CSV -> 2) `threat_labeler_standalone.py` -> labeled CSV -> 3) `Database.py` (COPY) -> Postgres -> 4) `dashboard_app.py` (Streamlit) or single-input evaluation.
+
+
+3. Threat Evaluation Calculations (detailed)
+--------------------------------------------
+This section documents the formulas and parameters used by the labeler and dashboard. It matches the project's `threat_scoring_formulas.txt` and `threat_labeler_standalone.py` logic.
+
+3.1. Signals
+- IOC extraction: regex-based detection of IPv4, URLs, domains, CVEs, hashes (md5/sha1/sha256), and email addresses.
+- Keyword matches: token-level and phrase-level matches drawn from universal, English, and Malay keyword lists.
+- Author history: number of prior "threat posts" by the author (two-pass calculation across the dataset).
+
+3.2. IOC weights (examples used in code)
+- ipv4: 0.8
+- url: 0.6
+- domain: 0.4
+- cve: 2.0
+- md5: 3.0
+- sha1: 3.0
+- sha256: 3.5
+- email: 0.2
+
+IOC raw score computation:
+  ioc_raw = Σ IOC_WEIGHT[type] * count(type)
+  ioc_hits = Σ count(type)
+
+3.3. Keyword scoring
+- Token keywords: matched against a tokenized lowercase text; each occurrence contributes weight(keyword).
+- Phrase keywords: multiword/hyphenated phrases matched with flexible separators; each occurrence contributes phrase weight.
+
+Token and phrase raw scores are summed into kw_raw; total keyword hits kw_hits is the number of matched token/phrase occurrences.
+
+3.4. Combine signals
+Base raw score:
+  raw = (2.0 * ioc_raw) + (1.0 * kw_raw)
+
+Smooth mapping to base confidence (0..1):
+  base_conf = 1 - exp(- raw / raw_scale)
+Default: raw_scale = 10.0
+
+Per-hit multipliers (boosts):
+- ioc_multiplier_per_hit = 0.05 (5% per IOC hit)
+- keyword_multiplier_per_hit = 0.03 (3% per keyword hit)
+Apply:
+  base_conf *= (1 + 0.05 * ioc_hits)  (if ioc_hits > 0)
+  base_conf *= (1 + 0.03 * kw_hits)   (if kw_hits > 0)
+Clamp base_conf to [0,1].
+
+3.5. Author correlation (two-pass)
+- Identify threat posts per author by counting rows with base_conf >= author_threat_conf_threshold (default 0.55).
+- Author multiplier:
+  author_mult = 1 + min(author_multiplier_per_threat_post * n, author_multiplier_cap)
+Defaults: author_multiplier_per_threat_post = 0.02, author_multiplier_cap = 0.50
+
+Final confidence:
+  Threat_Confidence = clamp01( base_conf * author_mult )
+
+3.6. Mapping to Threat_Level
+Thresholds (default):
+- conf >= 0.85 -> Critical
+- conf >= 0.70 -> High
+- conf >= 0.50 -> Medium
+- conf >= 0.25 -> Low
+- else -> None
+
+3.7. Safety cap by strongest keyword
+- Compute max_keyword_weight among matched keywords.
+- Map max_keyword_weight to a cap level:
+  >= 4.0 -> Critical
+  >= 3.4 -> High
+  >= 3.0 -> Medium
+  >= 2.4 -> Low
+  else -> None
+- Final Threat_Level = min(level_from_confidence, cap)
+This prevents inflation to Critical from many low-risk tokens.
+
+3.8. Dashboard single-input blending (author prior)
+When a user submits a single (Author, Texts):
+- Look up historical rows for the author and compute author_avg and author_max.
+- author_prior = clamp01(max(author_avg, 0.9 * author_max))
+- Blend weight alpha depends on k (number of historical rows):
+  alpha = min(0.65, 0.25 + 0.10 * ln(1 + k))
+- final_conf = clamp01((1 - alpha) * base_conf + alpha * author_prior)
+
+If the text has IOC/keyword hits, apply keyword cap as usual. If zero hits, author-history can raise the level.
+
+3.9. Example calculation (illustrative)
+Given: ioc_raw = 5, ioc_hits = 3, kw_raw = 4, kw_hits = 6
+- raw = 2*5 + 1*4 = 14
+- base_conf = 1 - exp(-14/10) = 1 - exp(-1.4) ≈ 0.7534
+- apply per-hit multipliers: (1 + 0.05*3) = 1.15; (1 + 0.03*6) = 1.18 => multiplier ≈ 1.357
+- boosted = 0.7534 * 1.357 ≈ 1.022 -> clamp to 1.0
+- if author has n = 5 threat posts, author_mult = 1 + min(0.02*5, 0.50) = 1.10
+- final Threat_Confidence = clamp01(1.0 * 1.10) = 1.0 -> maps to Critical, but then cap by max_keyword_weight may lower final Threat_Level.
+
+Notes: default parameters avoid runaway inflation via clamps; project also caps levels using max keyword severity.
+
+
+4. Frontend (Dashboard) and User Input Behavior
+----------------------------------------------
+Frontend:
+- `dashboard_app.py` runs a Streamlit app to explore dataset rows, filter by Threat_Level/keywords, and accept single-user inputs to score live.
+- Typical UI elements: text input for `Author`, large text area for `Texts`, language selector (or automatic), a submit button, and display of predicted Threat_Confidence/Threat_Level and matched IOCs/keywords.
+
+User input flow (single-item):
+1) User enters `Author` and `Texts` and clicks Evaluate.
+2) The dashboard computes base_conf (IOC+keywords), then fetches author history from Postgres and computes author_prior.
+3) Blend base_conf with author_prior using alpha based on number of historical rows.
+4) Show final_conf and Threat_Level; list matched IOCs, matched tokens/phrases with weights, and show any author-derived signals.
+5) Optionally allow insertion into DB (if enabled) with final_conf and level.
+
+Security considerations in frontend:
+- The app should sanitize displayed content (avoid rendering raw HTML). The project uses plain text outputs; be mindful if adding rich rendering.
+- Avoid logging secrets; DB credentials must be provided via environment variables or secure input. `Database.py` encourages using `PGPASSWORD` env var.
+
+
+5. Backend and Database Information
+----------------------------------
+Database utilities:
+- `Database.py` uses `psycopg2` and a `COPY` command for efficient CSV import.
+- Default table name: `threat_intelligence_data` (schema public). It derives column names from the CSV header row.
+- Column typing: `Threat_Confidence` -> `DOUBLE PRECISION`; all other columns default to `TEXT` for simplicity and compatibility.
+
+Connection configuration:
+- Host, port, database, user, and sslmode are read from environment variables or command-line flags. Default SSL mode is `require` (Supabase-friendly).
+- Password recommended via `PGPASSWORD` env var rather than inline flags.
+
+Suggested table schema (example produced by the script):
+- Columns exactly match CSV header columns. The upload step constructs `CREATE TABLE IF NOT EXISTS` with per-column SQL types (DOUBLE PRECISION for `Threat_Confidence`, TEXT otherwise).
+
+Notes on DB usage:
+- Use `--create-table` to create schema automatically during upload. Use `--truncate` to clear table before import.
+- After import, `dashboard_app.py` reads rows to compute author priors and to visualize dataset.
+
+
+6. Model(s) Used
+----------------
+This project is rule-based and deterministic rather than a machine-learned model. The labeling logic is a heuristic scoring pipeline composed of:
+- Regex-based IOC extraction
+- Token + phrase keyword matching with danger weights
+- Smooth mapping (exponential saturating function) to a confidence score
+- Multiplicative boosts and an author-history multiplier
+
+There is no trained ML model (no weights checkpoint files); instead, the system relies on curated keyword lists and weighting heuristics. This approach favors explainability, easy auditing, and quick iteration via keyword/weight updates.
+
+If in future a machine-learning model is added, it would likely be one of two options:
+- Supervised classifier trained on `language_dataset_threat_labeled.csv` (e.g., logistic regression / lightGBM / transformer fine-tune) to complement or replace heuristics.
+- A hybrid approach where heuristics produce labels used to bootstrap supervised training, then human review corrects edge cases.
+
+
+7. Keyword Lists and Danger Weights
+----------------------------------
+- The repository embeds keyword lists in `threat_labeler_standalone.py` and supports phrase matching.
+- Each keyword/phrase is associated with a danger weight (the `_danger_weight()` mapping) that determines cap levels and contributes to kw_raw.
+- Critical weights appear for explicit weapon or hard-drug keywords; lower weights for marketplace operations words.
+
+
+8. Deployment and Runtime
+-------------------------
+- Python environment: `requirements.txt` lists runtime dependencies (e.g., `streamlit`, `psycopg2`, etc.). Use a virtualenv.
+- Dashboard start: run `dashboard_app.py` via `streamlit run dashboard_app.py` or use provided run scripts (`run_dashboard_click.py`, `run_dashboard.ps1`) if configured.
+- DB upload: use `python Database.py --csv path/to/labeled.csv --create-table` and provide `PGPASSWORD` via env var or interactive prompt.
+
+
+9. Operational Recommendations
+------------------------------
+- Monitoring: add rate limits and usage logging to the dashboard if exposed publicly. Keep DB credentials in secrets storage.
+- Human-in-the-loop: surface borderline Medium/High items for analyst review before acting on them. Provide direct links to original posts where available.
+- Keyword and weight governance: keep a single source-of-truth keyword file and use staged changes (dev -> review -> prod) to avoid sudden behavior changes.
+- False positives: ambiguous tokens (e.g., "database", "shell") are intentionally low-weight; rely on IOC presence and higher-weight tokens for stronger signals.
+- Reproducibility: store the CSV header and the exact script version with each upload so results are auditable.
+
+
+10. Limitations and Known Caveats
+--------------------------------
+- Heuristic approach trades recall/precision balance; certain subtle threats may require contextual understanding beyond token matches.
+- Regex IOC extraction can produce noisy matches on obfuscated text; consider additional normalization for obfuscated IOCs.
+- Language mixing: the system currently combines English + Malay + universal lists when language is unknown, which can increase false positives.
+- Author correlation can amplify systematic biases if an author previously had poor-quality labels; consider decay windows or human review thresholds.
+
+
+11. Appendix — Quick reference (Formulas)
+----------------------------------------
+- ioc_raw = Σ IOC_WEIGHT[type] * count(type)
+- kw_raw = Σ keyword_weight * occurrences
+- raw = 2.0 * ioc_raw + 1.0 * kw_raw
+- base_conf = 1 - exp(- raw / raw_scale)
+- boosted_conf = base_conf * (1 + 0.05 * ioc_hits) * (1 + 0.03 * kw_hits)
+- author_mult = 1 + min(0.02 * threat_posts_by_author, 0.50)
+- Threat_Confidence = clamp01(boosted_conf * author_mult)
+- Level thresholds: 0.85/0.70/0.50/0.25
+- Keyword cap: mapped from max_keyword_weight -> max allowed level
+
+
+12. Where to find things (workspace files)
+-----------------------------------------
+- Labeling logic and keyword lists: threat_labeler_standalone.py
+- Scoring explanation: threat_scoring_formulas.txt
+- DB upload utility: Database.py
+- Dataset example: language_dataset_threat_labeled.csv
+- Dashboard frontend: dashboard_app.py
+- Run helpers: run_dashboard_click.py, run_dashboard.ps1
+
+
+Prepared by: Automated project-report generator (based on repository sources)
+Date: 2026-06-08
+
+End of report.

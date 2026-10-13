@@ -1,0 +1,258 @@
+Threat classification formulas (simple explanation)
+================================================
+
+This document explains how the script `Dataset_CTI_DW/threat_labeler_standalone.py` calculates:
+- Threat_Confidence (a number from 0 to 1)
+- Threat_Level (None / Low / Medium / High / Critical)
+
+It uses 3 sources of evidence:
+1) IOC extraction (Indicators of Compromise)
+2) Threat keywords (Malay + English + universal marketplace/drug/cyber terms)
+3) Author correlation (authors who often post threats get a small boost)
+
+
+A) Inputs used per row
+---------------------
+From each CSV row, the script mainly uses:
+- Author
+- Texts (the post text)
+- Language (English/Malay/etc.)
+
+
+B) IOC extraction (regex-based)
+------------------------------
+The script scans `Texts` using regex patterns and collects unique matches per IOC type:
+- ipv4: IPv4 addresses
+- url: http/https URLs
+- domain: common domain names (limited to several TLDs)
+- cve: CVE-YYYY-NNNN identifiers
+- md5 / sha1 / sha256: hash strings
+- email: email addresses
+
+B1) IOC raw score
+-----------------
+Let:
+- iocs[type] = set of unique matches of that IOC type
+- count(type) = len(iocs[type])
+
+Each IOC type has a weight:
+- ipv4: 0.8
+- url: 0.6
+- domain: 0.4
+- cve: 2.0
+- md5: 3.0
+- sha1: 3.0
+- sha256: 3.5
+- email: 0.2
+
+IOC raw score:
+  ioc_raw = Σ_over_types( IOC_WEIGHT[type] * count(type) )
+
+IOC hit count:
+  ioc_hits = Σ_over_types( count(type) )
+
+Notes:
+- URLs/domains are common even in non-threat posts, so they are weighted lower.
+- Hashes and CVEs are weighted higher because they are more “threat-like”.
+
+
+C) Keyword identification (tokens + phrases)
+-------------------------------------------
+The script scores keywords in two ways:
+
+C1) Token keywords
+-----------------
+Tokenization uses this pattern:
+  TOKEN_RE = [a-z0-9]+
+
+So the post text becomes a list of lowercase tokens:
+  tokens = tokenize(Texts)
+
+A “token keyword” matches when a keyword exactly equals a token.
+If a token appears multiple times, it counts multiple hits.
+
+Token keyword raw score:
+  kw_raw_tokens = Σ_over_keywords( weight(keyword) * occurrences_in_tokens(keyword) )
+
+Token keyword hits:
+  kw_hits_tokens = Σ_over_keywords( occurrences_in_tokens(keyword) )
+
+
+C2) Phrase keywords (hyphen/space/underscore flexible)
+-----------------------------------------------------
+Some keywords are multiword or hyphenated (example: "og-kush").
+These are matched with a regex that allows flexible separators:
+- "og-kush" matches "og-kush", "og kush", "og_kush"
+
+Phrase keyword raw score:
+  kw_raw_phrases = Σ_over_phrases( weight(phrase) * occurrences_in_text(phrase) )
+
+Phrase keyword hits:
+  kw_hits_phrases = Σ_over_phrases( occurrences_in_text(phrase) )
+
+
+C3) Which keyword lists are used?
+--------------------------------
+There are 3 keyword sources combined:
+1) Universal keywords (marketplace/drugs/fraud/cyber/etc.)
+2) English-specific threat keywords (if Language is English)
+3) Malay-specific threat keywords (if Language is Malay)
+
+If Language is unknown/mixed, it uses both Malay + English lists plus universal.
+
+Total keyword raw score:
+  kw_raw = (universal_token_score + universal_phrase_score) + (language_specific_token_score)
+
+Total keyword hit count:
+  kw_hits = (universal_token_hits + universal_phrase_hits) + (language_specific_token_hits)
+
+
+D) Combine IOC + keyword signals into a base raw score
+-----------------------------------------------------
+The script combines raw signals like this (IOC is treated as stronger evidence):
+
+  raw = (2.0 * ioc_raw) + (1.0 * kw_raw)
+
+
+E) Convert raw score to base confidence (0..1)
+---------------------------------------------
+The script uses a smooth saturating function:
+
+  base_conf = 1 - exp( - raw / raw_scale )
+
+Where:
+- raw_scale is a tunable parameter (default: 10.0)
+- If raw = 0, base_conf = 0
+- As raw grows, base_conf approaches 1
+
+
+F) Apply “per-hit” multipliers (IOC + keyword boosts)
+----------------------------------------------------
+After base_conf is computed, the script boosts it based on counts:
+
+If ioc_hits > 0:
+  base_conf = base_conf * (1 + ioc_multiplier_per_hit * ioc_hits)
+
+If kw_hits > 0:
+  base_conf = base_conf * (1 + keyword_multiplier_per_hit * kw_hits)
+
+Default multipliers:
+- ioc_multiplier_per_hit = 0.05  (5% per IOC hit)
+- keyword_multiplier_per_hit = 0.03 (3% per keyword hit)
+
+Then it clamps the result to the range [0, 1].
+
+So the final base confidence formula is:
+
+  base_conf = clamp01(
+      (1 - exp(-raw/raw_scale))
+      * (1 + 0.05 * ioc_hits)
+      * (1 + 0.03 * kw_hits)
+  )
+
+(When ioc_hits or kw_hits are 0, that multiplier is skipped.)
+
+
+G) Author correlation (two-pass multiplier)
+------------------------------------------
+This step uses ALL rows together.
+
+G1) Count “threat posts” per author
+----------------------------------
+A row counts as an author’s “threat post” if its base_conf is at least:
+- author_threat_conf_threshold (default: 0.55)
+
+For each author:
+  threat_posts_by_author[author] = number of rows by this author with base_conf >= 0.55
+
+G2) Apply author multiplier
+--------------------------
+For a row written by author A, let:
+  n = threat_posts_by_author[A]
+
+Multiplier:
+  author_mult = 1 + min(author_multiplier_per_threat_post * n, author_multiplier_cap)
+
+Defaults:
+- author_multiplier_per_threat_post = 0.02 (2% per threat post)
+- author_multiplier_cap = 0.50 (max +50%)
+
+Final confidence:
+
+  Threat_Confidence = clamp01( base_conf * author_mult )
+
+
+H) Convert confidence to Threat_Level
+------------------------------------
+The script first maps by simple thresholds:
+- if conf >= 0.85  -> Critical
+- elif conf >= 0.70 -> High
+- elif conf >= 0.50 -> Medium
+- elif conf >= 0.25 -> Low
+- else -> None
+
+
+I) Safety cap: limit Threat_Level using the most dangerous keyword matched
+-------------------------------------------------------------------------
+To prevent posts from becoming “Critical” just because they contain many low-risk marketplace words,
+the script caps the Threat_Level based on the single strongest keyword weight matched.
+
+It computes:
+  max_keyword_weight = maximum weight among all matched keywords (universal + language-specific)
+
+Then it sets a maximum allowed level (cap):
+- if max_keyword_weight >= 4.0 -> cap = Critical
+- elif max_keyword_weight >= 3.4 -> cap = High
+- elif max_keyword_weight >= 3.0 -> cap = Medium
+- elif max_keyword_weight >= 2.4 -> cap = Low
+- else -> cap = None
+
+Final Threat_Level is:
+  Threat_Level = min_severity( level_from_confidence, cap )
+
+Meaning: if the confidence says “Critical” but the strongest keyword is only a low-risk ops word,
+Threat_Level gets capped down.
+
+
+J) Summary (one-page view)
+-------------------------
+1) Extract IOCs -> ioc_raw, ioc_hits
+2) Tokenize + match keywords (token + phrase) -> kw_raw, kw_hits
+3) raw = 2*ioc_raw + 1*kw_raw
+4) base_conf = 1 - exp(-raw/raw_scale)
+5) base_conf *= (1 + 0.05*ioc_hits) and *= (1 + 0.03*kw_hits)
+6) Apply author correlation: conf *= (1 + min(0.02*n, 0.50))
+7) Threat_Level from thresholds, then cap by max_keyword_weight
+
+
+K) Dashboard “User Input” flow (single text + DB author history)
+--------------------------------------------------------------
+The Streamlit dashboard supports labeling a single user-provided (Author, Texts).
+It reuses the same language + threat keyword + IOC mechanisms above, then adds an
+extra author-history weight based on existing DB rows for that Author.
+
+K1) Author prior confidence
+--------------------------
+For the user-input Author A, the dashboard looks up existing rows in Postgres for A
+and computes:
+- author_avg = average Threat_Confidence for A (numeric rows only)
+- author_max = max Threat_Confidence for A
+
+Then it defines a conservative “prior”:
+  author_prior = clamp01( max(author_avg, 0.9 * author_max) )
+
+K2) Blend base confidence with author prior
+------------------------------------------
+Let base_conf be computed from the text content (sections B–F).
+Let k be the number of historical rows found for A.
+The dashboard chooses a blend weight alpha that grows with k:
+  alpha = min(0.65, 0.25 + 0.10 * ln(1 + k))
+
+Final confidence used for insertion:
+  final_conf = clamp01( (1 - alpha) * base_conf + alpha * author_prior )
+
+K3) Threat_Level mapping in this mode
+------------------------------------
+- If the text had any IOC/keyword hits, Threat_Level is capped by max_keyword_weight (section I).
+- If the text had zero IOC and zero keyword hits, the dashboard uses confidence thresholds directly
+  (no keyword cap) so author-history can still raise the level.
